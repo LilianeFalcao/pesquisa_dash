@@ -1,0 +1,866 @@
+
+import os
+import numpy as np
+import pandas as pd
+import streamlit as st
+import plotly.express as px
+import plotly.graph_objects as go
+
+# ============================================================
+# CONFIGURAÇÃO
+# ============================================================
+
+st.set_page_config(
+    page_title="Dashboard — Consumo e Anomalias",
+    page_icon="💧",
+    layout="wide"
+)
+
+PASTA_DADOS = "./dash"
+ARQUIVO_CSV = os.path.join(
+    PASTA_DADOS,
+    "dashboard_consumo_final.csv"
+)
+
+MESES = {
+    1: "Janeiro", 2: "Fevereiro", 3: "Março",
+    4: "Abril", 5: "Maio", 6: "Junho",
+    7: "Julho", 8: "Agosto", 9: "Setembro",
+    10: "Outubro", 11: "Novembro", 12: "Dezembro"
+}
+
+ORDEM_CONJUNTOS = [
+    "Validação 2024",
+    "Teste 2024",
+    "Aplicação 2025"
+]
+
+
+# ============================================================
+# FUNÇÕES
+# ============================================================
+
+@st.cache_data
+def carregar_csv(caminho):
+    return pd.read_csv(caminho, encoding="utf-8-sig")
+
+
+def converter_bool(serie):
+    """Converte corretamente booleanos lidos do CSV."""
+    if pd.api.types.is_bool_dtype(serie):
+        return serie.fillna(False)
+
+    mapa = {
+        "true": True, "false": False,
+        "1": True, "0": False,
+        "sim": True, "não": False,
+        "yes": True, "no": False
+    }
+
+    return (
+        serie.astype(str)
+        .str.strip()
+        .str.lower()
+        .map(mapa)
+        .fillna(False)
+        .astype(bool)
+    )
+
+
+def preparar_dataframe(df):
+    df = df.copy()
+
+    obrigatorias = [
+        "conjunto", "sala", "codigo_medidor", "data_alvo",
+        "consumo_real", "consumo_previsto", "anormal",
+        "limiar_erro", "erro_absoluto"
+    ]
+
+    faltantes = [c for c in obrigatorias if c not in df.columns]
+
+    if faltantes:
+        raise ValueError(
+            "Colunas ausentes no CSV: " + ", ".join(faltantes)
+        )
+
+    df["data_alvo"] = pd.to_datetime(
+        df["data_alvo"], errors="coerce"
+    )
+
+    for coluna in ["sala", "codigo_medidor", "conjunto"]:
+        df[coluna] = df[coluna].astype("string").fillna(
+            "Não informado"
+        )
+
+    colunas_numericas = [
+        "consumo_real",
+        "consumo_previsto",
+        "consumo_previsto_ajustado",
+        "erro",
+        "erro_absoluto",
+        "limiar_erro",
+        "indice_desvio",
+        "quantidade",
+        "p95"
+    ]
+
+    for coluna in colunas_numericas:
+        if coluna in df.columns:
+            df[coluna] = pd.to_numeric(
+                df[coluna], errors="coerce"
+            )
+
+    df["anormal"] = converter_bool(df["anormal"])
+
+    if "consumo_previsto_ajustado" not in df.columns:
+        df["consumo_previsto_ajustado"] = (
+            df["consumo_previsto"].clip(lower=0)
+        )
+
+    if "erro" not in df.columns:
+        df["erro"] = (
+            df["consumo_real"] - df["consumo_previsto"]
+        )
+
+    if "erro_absoluto" not in df.columns:
+        df["erro_absoluto"] = df["erro"].abs()
+
+    if "previsao_negativa" not in df.columns:
+        df["previsao_negativa"] = (
+            df["consumo_previsto"] < 0
+        )
+    else:
+        df["previsao_negativa"] = converter_bool(
+            df["previsao_negativa"]
+        )
+
+    if "tipo_desvio" not in df.columns:
+        df["tipo_desvio"] = np.select(
+            [
+                df["anormal"]
+                & (
+                    df["consumo_real"]
+                    > df["consumo_previsto"]
+                ),
+                df["anormal"]
+                & (
+                    df["consumo_real"]
+                    < df["consumo_previsto"]
+                )
+            ],
+            [
+                "Consumo acima do esperado",
+                "Consumo abaixo do esperado"
+            ],
+            default="Sem anomalia"
+        )
+
+    if "fonte_limiar" not in df.columns:
+        df["fonte_limiar"] = "Limiar calibrado em 2024"
+
+    df["ano"] = df["data_alvo"].dt.year
+    df["mes"] = df["data_alvo"].dt.month
+    df["mes_nome"] = df["mes"].map(MESES)
+
+    if "indice_desvio" not in df.columns:
+        df["indice_desvio"] = np.where(
+            df["limiar_erro"] > 0,
+            df["erro_absoluto"] / df["limiar_erro"],
+            np.nan
+        )
+
+    return df
+
+
+def calcular_metricas(df):
+    """
+    Calcula as métricas oficiais usando previsões brutas.
+    Viés = previsão bruta - consumo real.
+    """
+    dados = df.dropna(
+        subset=["consumo_real", "consumo_previsto"]
+    )
+
+    if dados.empty:
+        return {
+            "n": 0,
+            "mae": np.nan,
+            "rmse": np.nan,
+            "vies": np.nan,
+            "negativas": 0,
+            "pct_negativas": 0.0
+        }
+
+    real = dados["consumo_real"].to_numpy(dtype=float)
+    previsto = dados["consumo_previsto"].to_numpy(dtype=float)
+    erro = previsto - real
+
+    return {
+        "n": len(dados),
+        "mae": np.mean(np.abs(erro)),
+        "rmse": np.sqrt(np.mean(erro ** 2)),
+        "vies": np.mean(erro),
+        "negativas": int((previsto < 0).sum()),
+        "pct_negativas": 100 * np.mean(previsto < 0)
+    }
+
+
+def formatar_numero(valor, casas=2):
+    if pd.isna(valor):
+        return "—"
+
+    return (
+        f"{valor:,.{casas}f}"
+        .replace(",", "X")
+        .replace(".", ",")
+        .replace("X", ".")
+    )
+
+
+# ============================================================
+# CARREGAMENTO DO CSV CONSOLIDADO
+# ============================================================
+
+st.title("💧 Consumo de Água — Previsão e Detecção de Anomalias")
+
+st.markdown(
+    """
+    **Modelo:** LSTM para previsão diária do consumo de água.
+
+    **Regra de detecção:** sinaliza observações cujo erro absoluto
+    ultrapassa o limiar efetivo calibrado com a validação de 2024.
+    O limiar utiliza P95 individual quando há pelo menos 30 observações
+    e fallback global nos demais casos, com piso mínimo de 1 L.
+
+    **Importante:** uma anomalia indica um desvio em relação à previsão;
+    não confirma a existência de vazamento.
+    """
+)
+
+if not os.path.exists(ARQUIVO_CSV):
+    st.error(
+        f"Arquivo não encontrado: `{ARQUIVO_CSV}`. "
+        "Coloque o CSV exportado pelo notebook nessa pasta."
+    )
+    st.stop()
+
+try:
+    df_todos = preparar_dataframe(
+        carregar_csv(ARQUIVO_CSV)
+    )
+except Exception as erro:
+    st.error(f"Erro ao carregar o CSV: {erro}")
+    st.stop()
+
+conjuntos_disponiveis = (
+    df_todos["conjunto"].dropna().unique().tolist()
+)
+
+opcoes = [
+    nome for nome in ORDEM_CONJUNTOS
+    if nome in conjuntos_disponiveis
+]
+
+opcoes += sorted([
+    nome for nome in conjuntos_disponiveis
+    if nome not in opcoes
+])
+
+if not opcoes:
+    st.error("Nenhum conjunto de dados foi encontrado no CSV.")
+    st.stop()
+
+
+# ============================================================
+# SELEÇÃO DO CONJUNTO
+# ============================================================
+
+st.sidebar.header("📁 Conjunto de dados")
+
+indice_padrao = (
+    opcoes.index("Teste 2024")
+    if "Teste 2024" in opcoes else 0
+)
+
+conjunto = st.sidebar.selectbox(
+    "Conjunto",
+    opcoes,
+    index=indice_padrao
+)
+
+df = df_todos[
+    df_todos["conjunto"] == conjunto
+].copy()
+
+
+# ============================================================
+# FILTROS
+# ============================================================
+
+st.sidebar.header("🔎 Filtros")
+df_filtrado = df.copy()
+
+anos = sorted(
+    df_filtrado["ano"].dropna().astype(int).unique()
+)
+
+anos_sel = st.sidebar.multiselect(
+    "Ano", anos, default=anos
+)
+df_filtrado = df_filtrado[
+    df_filtrado["ano"].isin(anos_sel)
+]
+
+meses = sorted(
+    df_filtrado["mes"].dropna().astype(int).unique()
+)
+
+meses_sel = st.sidebar.multiselect(
+    "Mês",
+    meses,
+    default=meses,
+    format_func=lambda x: MESES.get(int(x), str(x))
+)
+df_filtrado = df_filtrado[
+    df_filtrado["mes"].isin(meses_sel)
+]
+
+salas = sorted(
+    df_filtrado["sala"].dropna().astype(str).unique()
+)
+
+sala_sel = st.sidebar.selectbox(
+    "Sala",
+    ["Todas as salas"] + salas
+)
+
+if sala_sel != "Todas as salas":
+    df_filtrado = df_filtrado[
+        df_filtrado["sala"] == sala_sel
+    ]
+
+medidores = sorted(
+    df_filtrado["codigo_medidor"]
+    .dropna().astype(str).unique()
+)
+
+medidores_sel = st.sidebar.multiselect(
+    "Medidor (opcional)", medidores
+)
+
+if medidores_sel:
+    df_filtrado = df_filtrado[
+        df_filtrado["codigo_medidor"].isin(medidores_sel)
+    ]
+
+datas_validas = df_filtrado["data_alvo"].dropna()
+
+if not datas_validas.empty:
+    data_min = datas_validas.min().date()
+    data_max = datas_validas.max().date()
+
+    periodo = st.sidebar.date_input(
+        "Período",
+        value=(data_min, data_max)
+    )
+
+    if isinstance(periodo, (tuple, list)) and len(periodo) == 2:
+        inicio = pd.Timestamp(periodo[0])
+        fim = pd.Timestamp(periodo[1]) + pd.Timedelta(days=1)
+
+        df_filtrado = df_filtrado[
+            (df_filtrado["data_alvo"] >= inicio)
+            & (df_filtrado["data_alvo"] < fim)
+        ]
+
+if st.sidebar.checkbox("Somente observações anormais"):
+    df_filtrado = df_filtrado[
+        df_filtrado["anormal"]
+    ]
+
+tipos = sorted(
+    df_filtrado["tipo_desvio"].dropna().unique()
+)
+
+tipos_sel = st.sidebar.multiselect(
+    "Tipo de desvio (opcional)", tipos
+)
+
+if tipos_sel:
+    df_filtrado = df_filtrado[
+        df_filtrado["tipo_desvio"].isin(tipos_sel)
+    ]
+
+if st.sidebar.checkbox("Somente previsões brutas negativas"):
+    df_filtrado = df_filtrado[
+        df_filtrado["previsao_negativa"]
+    ]
+
+st.sidebar.divider()
+st.sidebar.caption(
+    f"Registros após filtros: {len(df_filtrado):,}"
+    .replace(",", ".")
+)
+
+
+# ============================================================
+# INDICADORES PRINCIPAIS
+# ============================================================
+
+st.subheader(conjunto)
+
+metricas = calcular_metricas(df_filtrado)
+n = len(df_filtrado)
+
+n_anomalias = (
+    int(df_filtrado["anormal"].sum()) if n else 0
+)
+taxa_anomalias = (
+    100 * n_anomalias / n if n else 0
+)
+
+n_zero_anomalias = int(
+    (
+        df_filtrado["anormal"]
+        & (df_filtrado["consumo_real"] == 0)
+    ).sum()
+) if n else 0
+
+c1, c2, c3, c4, c5, c6 = st.columns(6)
+
+c1.metric(
+    "Observações",
+    f"{n:,}".replace(",", ".")
+)
+c2.metric(
+    "Anomalias",
+    f"{n_anomalias:,}".replace(",", ".")
+)
+c3.metric(
+    "Taxa de anomalias",
+    f"{formatar_numero(taxa_anomalias)}%"
+)
+c4.metric(
+    "MAE bruto",
+    f"{formatar_numero(metricas['mae'])} L"
+)
+c5.metric(
+    "RMSE bruto",
+    f"{formatar_numero(metricas['rmse'])} L"
+)
+c6.metric(
+    "Viés bruto",
+    f"{formatar_numero(metricas['vies'])} L"
+)
+
+c7, c8, c9 = st.columns(3)
+
+c7.metric(
+    "Medidores",
+    f"{df_filtrado[['sala', 'codigo_medidor']].drop_duplicates().shape[0]:,}"
+    .replace(",", ".")
+)
+c8.metric(
+    "Previsões negativas",
+    f"{metricas['negativas']:,}".replace(",", ".")
+)
+c9.metric(
+    "Anomalias com consumo zero",
+    f"{n_zero_anomalias:,}".replace(",", ".")
+)
+
+st.caption(
+    "Viés = previsão bruta − consumo real. "
+    "Valores negativos indicam subestimação média. "
+    "As métricas são recalculadas conforme os filtros ativos."
+)
+
+# Gráficos usam previsão ajustada a zero.
+# Métricas e classificação usam previsão bruta.
+COLUNA_PREVISAO_GRAFICO = "consumo_previsto_ajustado"
+
+
+# ============================================================
+# ABAS
+# ============================================================
+
+aba_visao, aba_anomalias, aba_erros, aba_series, aba_dados = st.tabs([
+    "📊 Visão geral",
+    "🚨 Anomalias",
+    "📉 Erros",
+    "📈 Série temporal",
+    "📋 Dados"
+])
+
+
+# ============================================================
+# VISÃO GERAL
+# ============================================================
+
+with aba_visao:
+    if df_filtrado.empty:
+        st.warning("Nenhum registro corresponde aos filtros.")
+    else:
+        st.subheader("Consumo real × consumo previsto")
+
+        dados_tempo = (
+            df_filtrado.groupby("data_alvo", as_index=False)
+            .agg(
+                consumo_real=("consumo_real", "mean"),
+                consumo_previsto=(
+                    COLUNA_PREVISAO_GRAFICO, "mean"
+                )
+            )
+            .sort_values("data_alvo")
+        )
+
+        fig = go.Figure()
+
+        fig.add_trace(go.Scatter(
+            x=dados_tempo["data_alvo"],
+            y=dados_tempo["consumo_real"],
+            mode="lines",
+            name="Consumo real"
+        ))
+
+        fig.add_trace(go.Scatter(
+            x=dados_tempo["data_alvo"],
+            y=dados_tempo["consumo_previsto"],
+            mode="lines",
+            name="Consumo previsto ajustado"
+        ))
+
+        fig.update_layout(
+            xaxis_title="Data",
+            yaxis_title="Consumo médio (L)",
+            hovermode="x unified"
+        )
+
+        st.plotly_chart(fig, width="stretch")
+
+        st.subheader("Distribuição das classificações")
+
+        resumo = (
+            df_filtrado["anormal"]
+            .map({False: "Normal", True: "Anormal"})
+            .value_counts()
+            .rename_axis("Classificação")
+            .reset_index(name="Quantidade")
+        )
+
+        fig_class = px.bar(
+            resumo,
+            x="Classificação",
+            y="Quantidade",
+            text_auto=True
+        )
+        st.plotly_chart(fig_class, width="stretch")
+
+        st.subheader("Consumo real × previsão ajustada")
+
+        fig_scatter = px.scatter(
+            df_filtrado,
+            x="consumo_real",
+            y=COLUNA_PREVISAO_GRAFICO,
+            color=df_filtrado["anormal"].map({
+                False: "Normal",
+                True: "Anormal"
+            }),
+            hover_data=[
+                "sala", "codigo_medidor", "data_alvo"
+            ],
+            labels={
+                "consumo_real": "Consumo real (L)",
+                COLUNA_PREVISAO_GRAFICO:
+                    "Consumo previsto ajustado (L)",
+                "color": "Classificação"
+            }
+        )
+
+        st.plotly_chart(fig_scatter, width="stretch")
+
+        st.info(
+            "As previsões exibidas nos gráficos são limitadas a zero. "
+            "As métricas oficiais e a classificação de anomalias usam "
+            "as previsões brutas."
+        )
+
+
+# ============================================================
+# ANOMALIAS
+# ============================================================
+
+with aba_anomalias:
+    st.header("🚨 Observações classificadas como anormais")
+
+    anom = df_filtrado[
+        df_filtrado["anormal"]
+    ].copy()
+
+    if anom.empty:
+        st.success(
+            "Nenhuma anomalia nos filtros selecionados."
+        )
+    else:
+        a1, a2, a3 = st.columns(3)
+
+        a1.metric("Anomalias", len(anom))
+
+        acima = int(
+            (anom["consumo_real"] > anom["consumo_previsto"]).sum()
+        )
+        abaixo = int(
+            (anom["consumo_real"] < anom["consumo_previsto"]).sum()
+        )
+
+        a2.metric("Acima da previsão", acima)
+        a3.metric("Abaixo da previsão", abaixo)
+
+        st.caption(
+            "Um alerta indica desvio em relação à previsão; "
+            "não confirma vazamento."
+        )
+
+        st.subheader("Direção dos desvios")
+
+        direcao = (
+            anom["tipo_desvio"]
+            .value_counts()
+            .rename_axis("Tipo de desvio")
+            .reset_index(name="Quantidade")
+        )
+
+        fig_dir = px.bar(
+            direcao,
+            x="Tipo de desvio",
+            y="Quantidade",
+            text_auto=True
+        )
+        st.plotly_chart(fig_dir, width="stretch")
+
+        st.subheader("Maiores desvios")
+
+        colunas = [
+            "sala", "codigo_medidor", "data_alvo",
+            "consumo_real", "consumo_previsto",
+            "consumo_previsto_ajustado",
+            "erro_absoluto", "limiar_erro",
+            "indice_desvio", "tipo_desvio", "fonte_limiar"
+        ]
+
+        colunas = [
+            c for c in colunas if c in anom.columns
+        ]
+
+        st.dataframe(
+            anom.sort_values(
+                "indice_desvio", ascending=False
+            )[colunas].head(100),
+            width="stretch",
+            hide_index=True
+        )
+
+        st.subheader("Anomalias por sala")
+
+        por_sala = (
+            anom.groupby("sala")
+            .size()
+            .reset_index(name="Anomalias")
+            .sort_values("Anomalias", ascending=False)
+        )
+
+        st.dataframe(
+            por_sala,
+            width="stretch",
+            hide_index=True
+        )
+
+
+# ============================================================
+# ERROS
+# ============================================================
+
+with aba_erros:
+    st.header("📉 Análise dos erros de previsão")
+
+    if df_filtrado.empty:
+        st.warning("Nenhum registro corresponde aos filtros.")
+    else:
+        fig_erro = px.histogram(
+            df_filtrado,
+            x="erro",
+            nbins=50,
+            labels={
+                "erro": "Erro = consumo real − previsão bruta"
+            }
+        )
+
+        fig_erro.add_vline(x=0, line_dash="dash")
+        st.plotly_chart(fig_erro, width="stretch")
+
+        st.subheader("Índice de desvio")
+
+        st.caption(
+            "Índice = erro absoluto / limiar efetivo. "
+            "Valores acima de 1 indicam anomalia."
+        )
+
+        fig_idx = px.histogram(
+            df_filtrado,
+            x="indice_desvio",
+            nbins=50
+        )
+        fig_idx.add_vline(x=1, line_dash="dash")
+
+        st.plotly_chart(fig_idx, width="stretch")
+
+        st.subheader("Maiores erros absolutos")
+
+        n_top = st.slider(
+            "Quantidade de registros",
+            min_value=5,
+            max_value=50,
+            value=10
+        )
+
+        colunas = [
+            "sala", "codigo_medidor", "data_alvo",
+            "consumo_real", "consumo_previsto",
+            "erro", "erro_absoluto", "limiar_erro", "anormal"
+        ]
+
+        colunas = [
+            c for c in colunas if c in df_filtrado.columns
+        ]
+
+        st.dataframe(
+            df_filtrado.sort_values(
+                "erro_absoluto", ascending=False
+            ).head(n_top)[colunas],
+            width="stretch",
+            hide_index=True
+        )
+
+
+# ============================================================
+# SÉRIE TEMPORAL
+# ============================================================
+
+with aba_series:
+    st.header("📈 Análise detalhada de uma série")
+
+    salas_disponiveis = sorted(
+        df_filtrado["sala"].dropna().astype(str).unique()
+    )
+
+    if not salas_disponiveis:
+        st.warning(
+            "Não existem salas para os filtros selecionados."
+        )
+    else:
+        sala_escolhida = st.selectbox(
+            "Sala para análise",
+            salas_disponiveis
+        )
+
+        df_sala = df_filtrado[
+            df_filtrado["sala"] == sala_escolhida
+        ].copy()
+
+        medidores_disponiveis = sorted(
+            df_sala["codigo_medidor"]
+            .dropna().astype(str).unique()
+        )
+
+        if not medidores_disponiveis:
+            st.warning("Não existem medidores para esta sala.")
+        else:
+            medidor_escolhido = st.selectbox(
+                "Medidor para análise",
+                medidores_disponiveis
+            )
+
+            df_serie = df_sala[
+                df_sala["codigo_medidor"] == medidor_escolhido
+            ].sort_values("data_alvo").copy()
+
+            fig_serie = go.Figure()
+
+            fig_serie.add_trace(go.Scatter(
+                x=df_serie["data_alvo"],
+                y=df_serie["consumo_real"],
+                mode="lines+markers",
+                name="Consumo real"
+            ))
+
+            fig_serie.add_trace(go.Scatter(
+                x=df_serie["data_alvo"],
+                y=df_serie[COLUNA_PREVISAO_GRAFICO],
+                mode="lines+markers",
+                name="Previsão ajustada"
+            ))
+
+            an = df_serie[df_serie["anormal"]]
+
+            if not an.empty:
+                fig_serie.add_trace(go.Scatter(
+                    x=an["data_alvo"],
+                    y=an["consumo_real"],
+                    mode="markers",
+                    name="Observação sinalizada",
+                    marker=dict(size=11, symbol="x")
+                ))
+
+            fig_serie.update_layout(
+                xaxis_title="Data",
+                yaxis_title="Consumo (L)",
+                hovermode="x unified"
+            )
+
+            st.plotly_chart(
+                fig_serie,
+                width="stretch"
+            )
+
+            st.caption(
+                "A linha de previsão é ajustada para exibição; "
+                "os alertas continuam usando a previsão bruta."
+            )
+
+            st.dataframe(
+                df_serie,
+                width="stretch",
+                hide_index=True
+            )
+
+
+# ============================================================
+# DADOS E DOWNLOAD
+# ============================================================
+
+with aba_dados:
+    st.header("📋 Dados utilizados na análise")
+
+    st.dataframe(
+        df_filtrado,
+        width="stretch",
+        hide_index=True
+    )
+
+    csv_download = df_filtrado.to_csv(
+        index=False
+    ).encode("utf-8-sig")
+
+    st.download_button(
+        "⬇️ Baixar dados filtrados",
+        data=csv_download,
+        file_name="dados_filtrados_dashboard.csv",
+        mime="text/csv"
+    )
+
+st.divider()
+
+st.caption(
+    "LSTM + detecção de anomalias por desvio em relação ao "
+    "comportamento esperado. Métricas calculadas com previsões brutas."
+)
