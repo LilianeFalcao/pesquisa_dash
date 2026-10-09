@@ -22,6 +22,10 @@ ARQUIVO_CSV = os.path.join(
     "dashboard_consumo_final.csv"
 )
 
+# Bases brutas usadas para caracterizar os perfis de consumo.
+ARQUIVO_BRUTO_2024 = os.path.join(PASTA_DADOS, "dados_medidores_2024.csv")
+ARQUIVO_BRUTO_2025 = os.path.join(PASTA_DADOS, "dados_medidores_2025.csv")
+
 MESES = {
     1: "Janeiro", 2: "Fevereiro", 3: "Março",
     4: "Abril", 5: "Maio", 6: "Junho",
@@ -39,6 +43,39 @@ ORDEM_CONJUNTOS = [
 # ============================================================
 # FUNÇÕES
 # ============================================================
+
+@st.cache_data
+def carregar_dados_brutos(caminho, ano):
+    """Carrega e padroniza registros brutos para análise de consumo."""
+    bruto = pd.read_csv(caminho, encoding="utf-8-sig", low_memory=False)
+    obrigatorias = ["datetime", "day_consumption", "codigo_medidor"]
+    faltantes = [c for c in obrigatorias if c not in bruto.columns]
+    if faltantes:
+        raise ValueError(f"Colunas ausentes em {os.path.basename(caminho)}: {', '.join(faltantes)}")
+
+    bruto["data"] = pd.to_datetime(bruto["datetime"], errors="coerce")
+    bruto["consumo_diario"] = pd.to_numeric(bruto["day_consumption"], errors="coerce")
+    if "sala_nome_completo" in bruto.columns:
+        bruto["sala"] = bruto["sala_nome_completo"].astype("string")
+    elif {"sala_bloco", "sala_numero"}.issubset(bruto.columns):
+        bruto["sala"] = bruto["sala_bloco"].astype("string") + " - " + bruto["sala_numero"].astype("string")
+    else:
+        bruto["sala"] = "Sala não identificada"
+
+    bruto["codigo_medidor"] = bruto["codigo_medidor"].astype("string")
+    bruto["ano_arquivo"] = ano
+    bruto["mes"] = bruto["data"].dt.month
+    bruto["mes_nome"] = bruto["mes"].map(MESES)
+    bruto["data_dia"] = bruto["data"].dt.date
+
+    # Mantém somente registros com data, sala, medidor e consumo válidos.
+    bruto = bruto.dropna(subset=["data", "consumo_diario", "sala", "codigo_medidor"])
+    bruto = bruto[bruto["sala"].str.lower().ne("<na>")]
+    bruto = bruto[bruto["sala"].str.strip().ne("")]
+    # Leituras negativas não são consumo físico válido para os gráficos descritivos.
+    bruto = bruto[bruto["consumo_diario"] >= 0].copy()
+    return bruto
+
 
 @st.cache_data
 def carregar_csv(caminho):
@@ -484,8 +521,9 @@ COLUNA_PREVISAO_GRAFICO = "consumo_previsto_ajustado"
 # ABAS
 # ============================================================
 
-aba_visao, aba_anomalias, aba_erros, aba_series, aba_dados = st.tabs([
+aba_visao, aba_perfis, aba_anomalias, aba_erros, aba_series, aba_dados = st.tabs([
     "📊 Visão geral",
+    "🏢 Perfil de consumo",
     "🚨 Anomalias",
     "📉 Erros",
     "📈 Série temporal",
@@ -584,6 +622,149 @@ with aba_visao:
             "As métricas oficiais e a classificação de anomalias usam "
             "as previsões brutas."
         )
+
+
+# ============================================================
+# PERFIL DE CONSUMO (DADOS BRUTOS DE 2024 E 2025)
+# ============================================================
+
+with aba_perfis:
+    st.header("🏢 Caracterização dos perfis de consumo")
+    st.markdown(
+        "Esta seção utiliza os registros brutos de consumo diário para comparar os períodos "
+        "e caracterizar as salas. Os gráficos descritivos não usam as previsões da LSTM. "
+        "Leituras negativas e registros sem identificação válida são excluídos desta análise."
+    )
+
+    arquivos_brutos = []
+    if os.path.exists(ARQUIVO_BRUTO_2024):
+        arquivos_brutos.append((ARQUIVO_BRUTO_2024, 2024))
+    if os.path.exists(ARQUIVO_BRUTO_2025):
+        arquivos_brutos.append((ARQUIVO_BRUTO_2025, 2025))
+
+    if not arquivos_brutos:
+        st.warning(
+            "Para habilitar esta seção, coloque os arquivos `dados_medidores_2024.csv` e "
+            "`dados_medidores_2025.csv` na pasta `dash/` do repositório."
+        )
+    else:
+        partes = []
+        erros_carga = []
+        for caminho_bruto, ano_bruto in arquivos_brutos:
+            try:
+                partes.append(carregar_dados_brutos(caminho_bruto, ano_bruto))
+            except Exception as exc:
+                erros_carga.append(f"{os.path.basename(caminho_bruto)}: {exc}")
+        if erros_carga:
+            st.warning("Alguns arquivos brutos não puderam ser carregados: " + " | ".join(erros_carga))
+
+        if not partes:
+            st.error("Não foi possível carregar os arquivos brutos para a análise de perfil.")
+        else:
+            perfil = pd.concat(partes, ignore_index=True)
+            anos_perfil = sorted(perfil["ano_arquivo"].dropna().unique().tolist())
+            col_filtros = st.columns([1, 1, 2])
+            with col_filtros[0]:
+                anos_perfil_sel = st.multiselect("Ano(s) para analisar", anos_perfil, default=anos_perfil, key="perfil_anos")
+            perfil = perfil[perfil["ano_arquivo"].isin(anos_perfil_sel)].copy()
+            with col_filtros[1]:
+                meses_perfil_sel = st.multiselect("Meses", list(range(1, 13)), default=list(range(1, 13)), format_func=lambda x: MESES[x], key="perfil_meses")
+            perfil = perfil[perfil["mes"].isin(meses_perfil_sel)].copy()
+            salas_perfil = sorted(perfil["sala"].dropna().unique().tolist())
+            with col_filtros[2]:
+                salas_perfil_sel = st.multiselect("Salas (opcional)", salas_perfil, key="perfil_salas")
+            if salas_perfil_sel:
+                perfil = perfil[perfil["sala"].isin(salas_perfil_sel)].copy()
+
+            if perfil.empty:
+                st.info("Não há registros para os filtros selecionados.")
+            else:
+                mensal = (
+                    perfil.assign(mes_data=perfil["data"].dt.to_period("M").dt.to_timestamp())
+                    .groupby(["ano_arquivo", "mes_data"], as_index=False)
+                    .agg(consumo_total_l=("consumo_diario", "sum"),
+                         consumo_medio_registro_l=("consumo_diario", "mean"),
+                         dias_registrados=("data_dia", "nunique"),
+                         medidores=("codigo_medidor", "nunique"))
+                )
+                # Indicador diário agregado: total mensal dividido pelos dias do calendário cobertos no mês.
+                mensal["consumo_medio_diario_l"] = mensal["consumo_total_l"] / mensal["mes_data"].dt.days_in_month
+                total_l = perfil["consumo_diario"].sum()
+                media_registro = perfil["consumo_diario"].mean()
+                mediana_registro = perfil["consumo_diario"].median()
+                salas_n = perfil["sala"].nunique()
+                k1, k2, k3, k4 = st.columns(4)
+                k1.metric("Consumo acumulado nos filtros", f"{formatar_numero(total_l, 1)} L")
+                k2.metric("Média por registro", f"{formatar_numero(media_registro, 2)} L")
+                k3.metric("Mediana por registro", f"{formatar_numero(mediana_registro, 2)} L")
+                k4.metric("Salas analisadas", f"{salas_n:,}".replace(",", "."))
+
+                st.subheader("1. Evolução do consumo mensal total")
+                fig_mensal = px.line(
+                    mensal, x="mes_data", y="consumo_total_l", color="ano_arquivo", markers=True,
+                    labels={"mes_data": "Mês", "consumo_total_l": "Consumo total (L)", "ano_arquivo": "Ano"},
+                    title="Consumo total registrado por mês"
+                )
+                fig_mensal.update_layout(hovermode="x unified")
+                st.plotly_chart(fig_mensal, width="stretch")
+
+                st.subheader("2. Comparação entre anos por mês do calendário")
+                mensal["mes_numero"] = mensal["mes_data"].dt.month
+                comparacao = mensal.groupby(["ano_arquivo", "mes_numero"], as_index=False).agg(consumo_total_l=("consumo_total_l", "sum"))
+                comparacao["mes_nome"] = comparacao["mes_numero"].map(MESES)
+                fig_comp = px.bar(
+                    comparacao, x="mes_nome", y="consumo_total_l", color="ano_arquivo", barmode="group",
+                    category_orders={"mes_nome": list(MESES.values())},
+                    labels={"mes_nome": "Mês", "consumo_total_l": "Consumo total (L)", "ano_arquivo": "Ano"},
+                    title="Comparação do consumo mensal entre anos"
+                )
+                st.plotly_chart(fig_comp, width="stretch")
+                st.caption("Compare meses equivalentes. Se um ano tiver registros incompletos, a diferença pode refletir também a cobertura dos dados.")
+
+                st.subheader("3. Consumo médio diário por sala")
+                por_sala = (
+                    perfil.groupby(["sala", "ano_arquivo"], as_index=False)
+                    .agg(consumo_medio_diario_l=("consumo_diario", "mean"),
+                         consumo_mediano_diario_l=("consumo_diario", "median"),
+                         observacoes=("consumo_diario", "size"),
+                         medidores=("codigo_medidor", "nunique"))
+                )
+                top_n = st.slider("Quantidade de salas no gráfico", min_value=5, max_value=40, value=15, key="perfil_top_n")
+                ordenar_ano = anos_perfil_sel[-1] if anos_perfil_sel else int(perfil["ano_arquivo"].max())
+                ranking = por_sala[por_sala["ano_arquivo"] == ordenar_ano].sort_values("consumo_medio_diario_l", ascending=False).head(top_n)
+                if not ranking.empty:
+                    fig_salas = px.bar(
+                        ranking.sort_values("consumo_medio_diario_l"), x="consumo_medio_diario_l", y="sala", orientation="h",
+                        hover_data=["observacoes", "medidores"],
+                        labels={"consumo_medio_diario_l": "Média por registro (L)", "sala": "Sala"},
+                        title=f"{top_n} salas com maior média por registro — {ordenar_ano}"
+                    )
+                    st.plotly_chart(fig_salas, width="stretch")
+                st.dataframe(por_sala.sort_values(["ano_arquivo", "consumo_medio_diario_l"], ascending=[True, False]), width="stretch", hide_index=True)
+
+                st.subheader("4. Mapa de calor: sala × mês")
+                perfil_heat = perfil.copy()
+                perfil_heat["mes_nome"] = perfil_heat["mes"].map(MESES)
+                heat = perfil_heat.groupby(["sala", "mes_nome"], as_index=False).agg(media_l=("consumo_diario", "mean"))
+                heat_pivot = heat.pivot(index="sala", columns="mes_nome", values="media_l")
+                heat_pivot = heat_pivot.reindex(columns=[m for m in MESES.values() if m in heat_pivot.columns])
+                salas_heat = por_sala.sort_values("consumo_medio_diario_l", ascending=False)["sala"].drop_duplicates().head(30).tolist()
+                heat_pivot = heat_pivot.loc[heat_pivot.index.intersection(salas_heat)]
+                if not heat_pivot.empty:
+                    fig_heat = px.imshow(
+                        heat_pivot, aspect="auto", color_continuous_scale="Blues",
+                        labels={"x": "Mês", "y": "Sala", "color": "Média (L)"},
+                        title="Média de consumo por registro, sala e mês"
+                    )
+                    st.plotly_chart(fig_heat, width="stretch")
+
+                st.subheader("Notas de interpretação")
+                st.markdown(
+                    "- A média por sala é calculada a partir dos registros de consumo diário disponíveis para a sala no período filtrado.\n"
+                    "- O consumo mensal total corresponde à soma dos registros de consumo diário no mês.\n"
+                    "- Os gráficos descrevem os dados disponíveis; diferenças entre anos devem ser interpretadas considerando eventuais lacunas ou alterações na cobertura dos medidores.\n"
+                    "- Leituras negativas foram excluídas da análise descritiva, pois não representam consumo físico positivo."
+                )
 
 
 # ============================================================
@@ -837,7 +1018,7 @@ with aba_series:
 # ============================================================
 # DADOS E DOWNLOAD
 # ============================================================
-
+        
 with aba_dados:
     st.header("📋 Dados utilizados na análise")
 
