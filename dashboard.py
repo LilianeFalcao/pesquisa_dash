@@ -67,6 +67,8 @@ def carregar_dados_brutos(caminho, ano):
     bruto["mes"] = bruto["data"].dt.month
     bruto["mes_nome"] = bruto["mes"].map(MESES)
     bruto["data_dia"] = bruto["data"].dt.date
+    # Segunda a sexta = dia útil; sábado e domingo = fim de semana.
+    bruto["tipo_dia"] = np.where(bruto["data"].dt.dayofweek < 5, "Dia útil", "Fim de semana")
 
     # Mantém somente registros com data, sala, medidor e consumo válidos.
     bruto = bruto.dropna(subset=["data", "consumo_diario", "sala", "codigo_medidor"])
@@ -699,7 +701,32 @@ with aba_perfis:
                 k3.metric("Mediana por registro", f"{formatar_numero(mediana_registro, 2)} L")
                 k4.metric("Salas analisadas", f"{salas_n:,}".replace(",", "."))
 
-                st.subheader("1. Evolução do consumo mensal total")
+                st.subheader("1. Comparação entre dias úteis e finais de semana")
+                # Agrega primeiro todos os medidores por data, para comparar o total diário da edificação.
+                diario_completo = (
+                    perfil.groupby(["data_dia", "tipo_dia"], as_index=False)
+                    .agg(consumo_total_dia_l=("consumo_diario", "sum"))
+                )
+                comparacao_dias = (
+                    diario_completo.groupby("tipo_dia", as_index=False)
+                    .agg(media_consumo_diario_l=("consumo_total_dia_l", "mean"),
+                         mediana_consumo_diario_l=("consumo_total_dia_l", "median"),
+                         dias_observados=("data_dia", "nunique"))
+                )
+                ordem_tipos = ["Dia útil", "Fim de semana"]
+                comparacao_dias["tipo_dia"] = pd.Categorical(comparacao_dias["tipo_dia"], categories=ordem_tipos, ordered=True)
+                comparacao_dias = comparacao_dias.sort_values("tipo_dia")
+                fig_dias = px.bar(
+                    comparacao_dias, x="tipo_dia", y="media_consumo_diario_l",
+                    error_y=None,
+                    labels={"tipo_dia": "Tipo de dia", "media_consumo_diario_l": "Consumo médio diário total (L)"},
+                    title="Média do consumo diário total: dias úteis × finais de semana",
+                    hover_data={"mediana_consumo_diario_l": ":.2f", "dias_observados": True}
+                )
+                st.plotly_chart(fig_dias, width="stretch")
+                st.caption("Dias úteis são considerados de segunda a sexta-feira; finais de semana, sábado e domingo. Feriados não são classificados separadamente.")
+
+                st.subheader("2. Evolução do consumo mensal total")
                 fig_mensal = px.line(
                     mensal, x="mes_data", y="consumo_total_l", color="ano_arquivo", markers=True,
                     labels={"mes_data": "Mês", "consumo_total_l": "Consumo total (L)", "ano_arquivo": "Ano"},
@@ -708,7 +735,7 @@ with aba_perfis:
                 fig_mensal.update_layout(hovermode="x unified")
                 st.plotly_chart(fig_mensal, width="stretch")
 
-                st.subheader("2. Comparação entre anos por mês do calendário")
+                st.subheader("3. Comparação entre anos por mês do calendário")
                 mensal["mes_numero"] = mensal["mes_data"].dt.month
                 comparacao = mensal.groupby(["ano_arquivo", "mes_numero"], as_index=False).agg(consumo_total_l=("consumo_total_l", "sum"))
                 comparacao["mes_nome"] = comparacao["mes_numero"].map(MESES)
@@ -721,7 +748,7 @@ with aba_perfis:
                 st.plotly_chart(fig_comp, width="stretch")
                 st.caption("Compare meses equivalentes. Se um ano tiver registros incompletos, a diferença pode refletir também a cobertura dos dados.")
 
-                st.subheader("3. Consumo médio diário por sala")
+                st.subheader("4. Consumo médio diário por sala")
                 por_sala = (
                     perfil.groupby(["sala", "ano_arquivo"], as_index=False)
                     .agg(consumo_medio_diario_l=("consumo_diario", "mean"),
@@ -742,7 +769,7 @@ with aba_perfis:
                     st.plotly_chart(fig_salas, width="stretch")
                 st.dataframe(por_sala.sort_values(["ano_arquivo", "consumo_medio_diario_l"], ascending=[True, False]), width="stretch", hide_index=True)
 
-                st.subheader("4. Mapa de calor: sala × mês")
+                st.subheader("5. Mapa de calor: sala × mês")
                 perfil_heat = perfil.copy()
                 perfil_heat["mes_nome"] = perfil_heat["mes"].map(MESES)
                 heat = perfil_heat.groupby(["sala", "mes_nome"], as_index=False).agg(media_l=("consumo_diario", "mean"))
@@ -1018,7 +1045,7 @@ with aba_series:
 # ============================================================
 # DADOS E DOWNLOAD
 # ============================================================
-        
+
 with aba_dados:
     st.header("📋 Dados utilizados na análise")
 
