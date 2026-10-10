@@ -756,17 +756,36 @@ with aba_perfis:
                          observacoes=("consumo_diario", "size"),
                          medidores=("codigo_medidor", "nunique"))
                 )
-                top_n = st.slider("Quantidade de salas no gráfico", min_value=5, max_value=40, value=15, key="perfil_top_n")
+                col_top, col_escala = st.columns([2, 1])
+                with col_top:
+                    top_n = st.slider("Quantidade de salas no gráfico", min_value=5, max_value=40, value=15, key="perfil_top_n")
+                with col_escala:
+                    escala_salas = st.selectbox(
+                        "Escala do eixo de consumo",
+                        options=["Linear", "Logarítmica"],
+                        index=0,
+                        key="perfil_escala_salas",
+                        help="A escala logarítmica ajuda a comparar salas quando há diferenças muito grandes entre os valores."
+                    )
                 ordenar_ano = anos_perfil_sel[-1] if anos_perfil_sel else int(perfil["ano_arquivo"].max())
                 ranking = por_sala[por_sala["ano_arquivo"] == ordenar_ano].sort_values("consumo_medio_diario_l", ascending=False).head(top_n)
                 if not ranking.empty:
-                    fig_salas = px.bar(
-                        ranking.sort_values("consumo_medio_diario_l"), x="consumo_medio_diario_l", y="sala", orientation="h",
-                        hover_data=["observacoes", "medidores"],
-                        labels={"consumo_medio_diario_l": "Média por registro (L)", "sala": "Sala"},
-                        title=f"{top_n} salas com maior média por registro — {ordenar_ano}"
-                    )
-                    st.plotly_chart(fig_salas, width="stretch")
+                    ranking_plot = ranking.sort_values("consumo_medio_diario_l").copy()
+                    if escala_salas == "Logarítmica":
+                        ranking_plot = ranking_plot[ranking_plot["consumo_medio_diario_l"] > 0]
+                    if not ranking_plot.empty:
+                        fig_salas = px.bar(
+                            ranking_plot, x="consumo_medio_diario_l", y="sala", orientation="h",
+                            hover_data=["observacoes", "medidores"],
+                            labels={"consumo_medio_diario_l": "Média por registro (L)", "sala": "Sala"},
+                            title=f"{len(ranking_plot)} salas com maior média por registro — {ordenar_ano}"
+                        )
+                        if escala_salas == "Logarítmica":
+                            fig_salas.update_xaxes(type="log", title="Média por registro (L) — escala logarítmica")
+                            st.caption("A escala logarítmica facilita a visualização de diferenças entre valores muito distantes. Valores iguais a zero não aparecem nessa escala; os dados originais não são alterados.")
+                        st.plotly_chart(fig_salas, width="stretch")
+                    else:
+                        st.info("Não há valores positivos para exibir na escala logarítmica.")
                 st.dataframe(por_sala.sort_values(["ano_arquivo", "consumo_medio_diario_l"], ascending=[True, False]), width="stretch", hide_index=True)
 
                 st.subheader("5. Mapa de calor: sala × mês")
