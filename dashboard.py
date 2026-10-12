@@ -74,8 +74,10 @@ def carregar_dados_brutos(caminho, ano):
     bruto = bruto.dropna(subset=["data", "consumo_diario", "sala", "codigo_medidor"])
     bruto = bruto[bruto["sala"].str.lower().ne("<na>")]
     bruto = bruto[bruto["sala"].str.strip().ne("")]
-    # Leituras negativas não são consumo físico válido para os gráficos descritivos.
-    bruto = bruto[bruto["consumo_diario"] >= 0].copy()
+    # Preserva os valores originais, inclusive leituras negativas, sem corrigi-los
+    # ou removê-los silenciosamente. Leituras negativas são sinalizadas para
+    # auditoria, pois podem indicar inconsistência, ajuste ou fluxo reverso.
+    bruto["leitura_negativa"] = bruto["consumo_diario"] < 0
     return bruto
 
 
@@ -749,64 +751,159 @@ with aba_perfis:
                 st.caption("Compare meses equivalentes. Se um ano tiver registros incompletos, a diferença pode refletir também a cobertura dos dados.")
 
                 st.subheader("4. Consumo médio diário por sala")
-                por_sala = (
-                    perfil.groupby(["sala", "ano_arquivo"], as_index=False)
-                    .agg(consumo_medio_diario_l=("consumo_diario", "mean"),
-                         consumo_mediano_diario_l=("consumo_diario", "median"),
-                         observacoes=("consumo_diario", "size"),
-                         medidores=("codigo_medidor", "nunique"))
+                # Primeiro soma todos os medidores de cada sala em cada dia; só depois calcula a média diária.
+                diario_por_sala_ano = (
+                    perfil.groupby(["sala", "ano_arquivo", "data_dia"], as_index=False)
+                    .agg(consumo_total_dia_sala_l=("consumo_diario", "sum"),
+                         medidores_no_dia=("codigo_medidor", "nunique"))
                 )
-                col_top, col_escala = st.columns([2, 1])
-                with col_top:
-                    top_n = st.slider("Quantidade de salas no gráfico", min_value=5, max_value=40, value=15, key="perfil_top_n")
-                with col_escala:
-                    escala_salas = st.selectbox(
-                        "Escala do eixo de consumo",
-                        options=["Linear", "Logarítmica"],
-                        index=0,
-                        key="perfil_escala_salas",
-                        help="A escala logarítmica ajuda a comparar salas quando há diferenças muito grandes entre os valores."
-                    )
+                por_sala = (
+                    diario_por_sala_ano.groupby(["sala", "ano_arquivo"], as_index=False)
+                    .agg(consumo_medio_diario_l=("consumo_total_dia_sala_l", "mean"),
+                         consumo_mediano_diario_l=("consumo_total_dia_sala_l", "median"),
+                         dias_observados=("data_dia", "nunique"),
+                         medidores=("medidores_no_dia", "max"))
+                )
+                # "Sala Não Mapeada" agrega medidores sem associação confiável a uma sala física.
+                # Mantemos esses registros nos indicadores gerais, mas não no ranking por sala.
+                sala_norm = por_sala["sala"].astype(str).str.normalize("NFKD").str.encode("ascii", errors="ignore").str.decode("ascii").str.lower()
+                mask_sala_valida = ~sala_norm.str.contains(r"nao mapead|nao identificad|sem sala|desconhecid", regex=True, na=False)
+                por_sala_mapeadas = por_sala[mask_sala_valida].copy()
+                if (~mask_sala_valida).any():
+                    st.caption("Salas sem identificação confiável foram excluídas apenas dos gráficos comparativos por sala; seus registros permanecem nos indicadores gerais da edificação.")
+                top_n = st.slider("Quantidade de salas no gráfico", min_value=5, max_value=40, value=15, key="perfil_top_n")
                 ordenar_ano = anos_perfil_sel[-1] if anos_perfil_sel else int(perfil["ano_arquivo"].max())
-                ranking = por_sala[por_sala["ano_arquivo"] == ordenar_ano].sort_values("consumo_medio_diario_l", ascending=False).head(top_n)
+                ranking = por_sala_mapeadas[por_sala_mapeadas["ano_arquivo"] == ordenar_ano].sort_values("consumo_medio_diario_l", ascending=False).head(top_n)
                 if not ranking.empty:
                     ranking_plot = ranking.sort_values("consumo_medio_diario_l").copy()
-                    if escala_salas == "Logarítmica":
-                        ranking_plot = ranking_plot[ranking_plot["consumo_medio_diario_l"] > 0]
-                    if not ranking_plot.empty:
-                        fig_salas = px.bar(
-                            ranking_plot, x="consumo_medio_diario_l", y="sala", orientation="h",
-                            hover_data=["observacoes", "medidores"],
-                            labels={"consumo_medio_diario_l": "Média por registro (L)", "sala": "Sala"},
-                            title=f"{len(ranking_plot)} salas com maior média por registro — {ordenar_ano}"
-                        )
-                        if escala_salas == "Logarítmica":
-                            fig_salas.update_xaxes(type="log", title="Média por registro (L) — escala logarítmica")
-                            st.caption("A escala logarítmica facilita a visualização de diferenças entre valores muito distantes. Valores iguais a zero não aparecem nessa escala; os dados originais não são alterados.")
-                        st.plotly_chart(fig_salas, width="stretch")
-                    else:
-                        st.info("Não há valores positivos para exibir na escala logarítmica.")
-                st.dataframe(por_sala.sort_values(["ano_arquivo", "consumo_medio_diario_l"], ascending=[True, False]), width="stretch", hide_index=True)
+                    ranking_plot["consumo_plot"] = ranking_plot["consumo_medio_diario_l"]
+                    max_valor = float(ranking_plot["consumo_plot"].max())
+                    fig_salas = px.bar(
+                        ranking_plot, x="consumo_plot", y="sala", orientation="h",
+                        hover_data={"consumo_plot":":.2f", "consumo_medio_diario_l":":.2f", "consumo_mediano_diario_l":":.2f", "dias_observados":True, "medidores":True},
+                        labels={"consumo_plot":"Consumo médio diário (L/dia)", "consumo_medio_diario_l":"Consumo médio diário (L/dia)", "consumo_mediano_diario_l":"Consumo mediano diário (L/dia)", "sala": "Sala"},
+                        title=f"{len(ranking_plot)} salas com maior consumo médio diário — {ordenar_ano}"
+                    )
+                    # Escala em litros, com marcas legíveis e sem converter automaticamente para milhares.
+                    if max_valor > 0:
+                        passo_bruto = max_valor / 5
+                        magnitude = 10 ** int(__import__("math").floor(__import__("math").log10(passo_bruto))) if passo_bruto > 0 else 1
+                        candidatos = [1, 2, 2.5, 5, 10]
+                        passo = next((c * magnitude for c in candidatos if c * magnitude >= passo_bruto), 10 * magnitude)
+                        fig_salas.update_xaxes(range=[0, max_valor * 1.15], dtick=passo, tick0=0, title="Consumo médio diário (L/dia)")
+                    fig_salas.update_layout(margin={"l": 20, "r": 20, "t": 70, "b": 45})
+                    st.plotly_chart(fig_salas, width="stretch")
+                st.dataframe(por_sala_mapeadas.sort_values(["ano_arquivo", "consumo_medio_diario_l"], ascending=[True, False]), width="stretch", hide_index=True)
 
                 st.subheader("5. Mapa de calor: sala × mês")
                 perfil_heat = perfil.copy()
                 perfil_heat["mes_nome"] = perfil_heat["mes"].map(MESES)
-                heat = perfil_heat.groupby(["sala", "mes_nome"], as_index=False).agg(media_l=("consumo_diario", "mean"))
+                heat_diario = perfil_heat.groupby(["sala", "mes_nome", "data_dia"], as_index=False).agg(total_diario_sala_l=("consumo_diario", "sum"))
+                heat = heat_diario.groupby(["sala", "mes_nome"], as_index=False).agg(media_l=("total_diario_sala_l", "mean"))
                 heat_pivot = heat.pivot(index="sala", columns="mes_nome", values="media_l")
                 heat_pivot = heat_pivot.reindex(columns=[m for m in MESES.values() if m in heat_pivot.columns])
-                salas_heat = por_sala.sort_values("consumo_medio_diario_l", ascending=False)["sala"].drop_duplicates().head(30).tolist()
+                salas_heat = por_sala_mapeadas.sort_values("consumo_medio_diario_l", ascending=False)["sala"].drop_duplicates().head(30).tolist()
                 heat_pivot = heat_pivot.loc[heat_pivot.index.intersection(salas_heat)]
                 if not heat_pivot.empty:
+                    # Escala robusta: valores extremos não devem deixar quase todas as células brancas.
+                    valores_validos = heat_pivot.to_numpy(dtype=float)
+                    valores_validos = valores_validos[np.isfinite(valores_validos)]
+                    valores_positivos = valores_validos[valores_validos > 0]
+                    limite_cor = float(np.percentile(valores_positivos, 95)) if len(valores_positivos) else 1.0
+                    if not np.isfinite(limite_cor) or limite_cor <= 0:
+                        limite_cor = float(np.nanmax(valores_validos)) if len(valores_validos) else 1.0
                     fig_heat = px.imshow(
                         heat_pivot, aspect="auto", color_continuous_scale="Blues",
-                        labels={"x": "Mês", "y": "Sala", "color": "Média (L)"},
-                        title="Média de consumo por registro, sala e mês"
+                        zmin=0, zmax=limite_cor,
+                        labels={"x": "Mês", "y": "Sala", "color": "Média (L/dia)"},
+                        title="Consumo médio diário por sala e mês (L/dia)"
+                    )
+                    fig_heat.update_layout(
+                        coloraxis_colorbar={"title": "L/dia", "tickformat": ",.0f"},
+                        margin={"l": 20, "r": 20, "t": 70, "b": 40},
+                        height=max(420, min(900, 28 * len(heat_pivot) + 180))
+                    )
+                    fig_heat.update_traces(
+                        hovertemplate="Sala: %{y}<br>Mês: %{x}<br>Média diária: %{z:,.2f} L/dia<extra></extra>"
                     )
                     st.plotly_chart(fig_heat, width="stretch")
+                    st.caption(f"Escala de cores ajustada ao percentil 95 dos valores positivos ({formatar_numero(limite_cor, 1)} L/dia) para destacar diferenças entre as salas. Valores acima desse limite continuam disponíveis ao passar o cursor.")
+
+                st.subheader("6. Consumo por hora")
+
+                # Soma os medidores por sala/data e calcula médias no período filtrado.
+                diario_sala = (
+                    perfil.groupby(["data_dia", "sala"], as_index=False)
+                    .agg(consumo_diario_sala_l=("consumo_diario", "sum"))
+                )
+                media_diaria_edificacao = (
+                    perfil.groupby("data_dia", as_index=False)
+                    .agg(consumo_diario_edificacao_l=("consumo_diario", "sum"))
+                    ["consumo_diario_edificacao_l"].mean()
+                )
+                medias_sala = (
+                    diario_sala.groupby("sala", as_index=False)
+                    .agg(consumo_medio_diario_sala_l=("consumo_diario_sala_l", "mean"),
+                         dias_observados=("data_dia", "nunique"))
+                    .sort_values("consumo_medio_diario_sala_l", ascending=False)
+                )
+                if not medias_sala.empty:
+                    sala_horaria = st.selectbox(
+                        "Sala para consultar",
+                        options=medias_sala["sala"].tolist(),
+                        key="perfil_sala_horaria"
+                    )
+                    media_diaria_sala = float(
+                        medias_sala.loc[medias_sala["sala"] == sala_horaria, "consumo_medio_diario_sala_l"].iloc[0]
+                    )
+                    consumo_hora_edificacao = float(media_diaria_edificacao) / 24 if pd.notna(media_diaria_edificacao) else 0.0
+                    consumo_hora_sala = media_diaria_sala / 24
+
+                    m1, m2 = st.columns(2)
+                    m1.metric("Edificação — média por hora", f"{formatar_numero(consumo_hora_edificacao, 2)} L/h")
+                    m2.metric(f"Sala {sala_horaria} — média por hora", f"{formatar_numero(consumo_hora_sala, 2)} L/h")
+
+                    st.markdown("**Média por hora ao longo do dia**")
+                    horas = pd.DataFrame({
+                        "Hora": [f"{h:02d}:00–{(h + 1) % 24:02d}:00" for h in range(24)],
+                        "Edificação (L/h)": [consumo_hora_edificacao] * 24,
+                        f"Sala {sala_horaria} (L/h)": [consumo_hora_sala] * 24,
+                    })
+                    col_edif, col_sala = st.columns(2)
+                    with col_edif:
+                        fig_edif_hora = px.bar(
+                            horas, x="Hora", y="Edificação (L/h)",
+                            title="Edificação", text_auto=".1f"
+                        )
+                        fig_edif_hora.update_layout(yaxis_title="L/h", xaxis_title="", showlegend=False)
+                        fig_edif_hora.update_xaxes(tickangle=-45, nticks=8)
+                        st.plotly_chart(fig_edif_hora, width="stretch")
+                    with col_sala:
+                        coluna_sala_hora = f"Sala {sala_horaria} (L/h)"
+                        fig_sala_hora = px.bar(
+                            horas, x="Hora", y=coluna_sala_hora,
+                            title=f"Sala {sala_horaria}", text_auto=".1f"
+                        )
+                        fig_sala_hora.update_layout(yaxis_title="L/h", xaxis_title="", showlegend=False)
+                        fig_sala_hora.update_xaxes(tickangle=-45, nticks=8)
+                        st.plotly_chart(fig_sala_hora, width="stretch")
+
+                    with st.expander("Consultar valores para cada hora do dia"):
+                        st.dataframe(horas, width="stretch", hide_index=True)
+
+                    with st.expander("Consultar consumo médio por hora de todas as salas"):
+                        tabela_horaria = medias_sala.copy()
+                        tabela_horaria["Consumo médio diário (L/dia)"] = tabela_horaria["consumo_medio_diario_sala_l"]
+                        tabela_horaria["Consumo médio por hora (L/h)"] = tabela_horaria["consumo_medio_diario_sala_l"] / 24
+                        tabela_horaria = tabela_horaria.rename(columns={"sala": "Sala", "dias_observados": "Dias observados"})
+                        tabela_horaria = tabela_horaria[["Sala", "Consumo médio diário (L/dia)", "Consumo médio por hora (L/h)", "Dias observados"]]
+                        st.dataframe(tabela_horaria, width="stretch", hide_index=True)
+                else:
+                    st.info("Não há dados suficientes para calcular o consumo por hora nos filtros selecionados.")
 
                 st.subheader("Notas de interpretação")
                 st.markdown(
-                    "- A média por sala é calculada a partir dos registros de consumo diário disponíveis para a sala no período filtrado.\n"
+                    "- O consumo médio diário por sala é calculado somando os medidores da sala em cada data e, em seguida, calculando a média desses totais diários.\n"
                     "- O consumo mensal total corresponde à soma dos registros de consumo diário no mês.\n"
                     "- Os gráficos descrevem os dados disponíveis; diferenças entre anos devem ser interpretadas considerando eventuais lacunas ou alterações na cobertura dos medidores.\n"
                     "- Leituras negativas foram excluídas da análise descritiva, pois não representam consumo físico positivo."
