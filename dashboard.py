@@ -1334,32 +1334,79 @@ with aba_visao:
         )
 
         st.subheader("Consumo real × previsão ajustada")
-
-        fig_scatter = px.scatter(
-            df_filtrado,
-            x="consumo_real",
-            y=COLUNA_PREVISAO_GRAFICO,
-            color=df_filtrado["anormal"].map({
-                False: "Normal",
-                True: "Anormal"
-            }),
-            hover_data=[
-                "sala",
-                "codigo_medidor",
-                "data_alvo"
-            ],
-            labels={
-                "consumo_real": "Consumo real (L)",
-                COLUNA_PREVISAO_GRAFICO:
-                    "Consumo previsto ajustado (L)",
-                "color": "Classificação"
-            }
+        st.caption(
+            "Cada ponto representa uma observação. Valores extremos de consumo "
+            "real podem comprimir a maior parte dos pontos perto da origem."
         )
 
-        st.plotly_chart(
-            fig_scatter,
-            width="stretch"
+        col_real = pd.to_numeric(
+            df_filtrado["consumo_real"], errors="coerce"
         )
+        col_previsto = pd.to_numeric(
+            df_filtrado[COLUNA_PREVISAO_GRAFICO], errors="coerce"
+        )
+        mascara_valida = col_real.notna() & col_previsto.notna()
+        dados_scatter = df_filtrado.loc[mascara_valida].copy()
+        dados_scatter["consumo_real"] = col_real.loc[mascara_valida]
+        dados_scatter[COLUNA_PREVISAO_GRAFICO] = col_previsto.loc[mascara_valida]
+        dados_scatter["Classificação"] = dados_scatter["anormal"].map({
+            False: "Normal",
+            True: "Anormal"
+        })
+
+        mostrar_extremos = st.checkbox(
+            "Mostrar todos os valores extremos no gráfico",
+            value=False,
+            key="mostrar_extremos_scatter"
+        )
+
+        if not dados_scatter.empty:
+            if mostrar_extremos:
+                dados_plot = dados_scatter
+                titulo_scatter = "Consumo real × previsão ajustada — todos os registros"
+                extremos_ocultos = 0
+            else:
+                # Limita a visualização aos 99% centrais de cada eixo para
+                # evitar que poucos picos comprimam a nuvem principal.
+                limite_x = dados_scatter["consumo_real"].quantile(0.99)
+                limite_y = dados_scatter[COLUNA_PREVISAO_GRAFICO].quantile(0.99)
+                mascara_central = (
+                    (dados_scatter["consumo_real"] <= limite_x)
+                    & (dados_scatter[COLUNA_PREVISAO_GRAFICO] <= limite_y)
+                )
+                dados_plot = dados_scatter.loc[mascara_central].copy()
+                extremos_ocultos = len(dados_scatter) - len(dados_plot)
+                titulo_scatter = "Consumo real × previsão ajustada — faixa central (até P99)"
+
+            fig_scatter = px.scatter(
+                dados_plot,
+                x="consumo_real",
+                y=COLUNA_PREVISAO_GRAFICO,
+                color="Classificação",
+                hover_data=["sala", "codigo_medidor", "data_alvo"],
+                labels={
+                    "consumo_real": "Consumo real (L)",
+                    COLUNA_PREVISAO_GRAFICO: "Consumo previsto ajustado (L)"
+                },
+                title=titulo_scatter,
+                opacity=0.65
+            )
+            fig_scatter.update_layout(
+                xaxis_title="Consumo real (L)",
+                yaxis_title="Consumo previsto ajustado (L)",
+                legend_title="Classificação"
+            )
+            st.plotly_chart(fig_scatter, width="stretch")
+
+            if not mostrar_extremos and extremos_ocultos:
+                st.caption(
+                    f"Para facilitar a leitura, {extremos_ocultos:,} ponto(s) "
+                    "acima do percentil 99 em pelo menos um dos eixos não são "
+                    "exibidos nesta visualização. Os registros não foram apagados "
+                    "dos dados; marque a opção acima para visualizar todos."
+                )
+        else:
+            st.info("Não há pares válidos de consumo real e previsto para o gráfico.")
 
         st.info(
             "As previsões exibidas nos gráficos são limitadas a zero. "
@@ -1546,93 +1593,6 @@ with aba_perfis:
                 k4.metric(
                     "Salas analisadas",
                     f"{salas_n:,}".replace(",", ".")
-                )
-
-                # ------------------------------------------------
-                # 1. DIAS ÚTEIS X FINAIS DE SEMANA
-                # ------------------------------------------------
-
-                st.subheader(
-                    "1. Comparação entre dias úteis e finais de semana"
-                )
-
-                diario_completo = (
-                    perfil.groupby(
-                        ["data_dia", "tipo_dia"],
-                        as_index=False
-                    )
-                    .agg(
-                        consumo_total_dia_l=(
-                            "consumo_diario",
-                            "sum"
-                        )
-                    )
-                )
-
-                comparacao_dias = (
-                    diario_completo.groupby(
-                        "tipo_dia",
-                        as_index=False
-                    )
-                    .agg(
-                        media_consumo_diario_l=(
-                            "consumo_total_dia_l",
-                            "mean"
-                        ),
-                        mediana_consumo_diario_l=(
-                            "consumo_total_dia_l",
-                            "median"
-                        ),
-                        dias_observados=(
-                            "data_dia",
-                            "nunique"
-                        )
-                    )
-                )
-
-                ordem_tipos = [
-                    "Dia útil",
-                    "Fim de semana"
-                ]
-
-                comparacao_dias["tipo_dia"] = pd.Categorical(
-                    comparacao_dias["tipo_dia"],
-                    categories=ordem_tipos,
-                    ordered=True
-                )
-
-                comparacao_dias = comparacao_dias.sort_values(
-                    "tipo_dia"
-                )
-
-                fig_dias = px.bar(
-                    comparacao_dias,
-                    x="tipo_dia",
-                    y="media_consumo_diario_l",
-                    labels={
-                        "tipo_dia": "Tipo de dia",
-                        "media_consumo_diario_l":
-                            "Consumo médio diário total (L)"
-                    },
-                    title=(
-                        "Média do consumo diário total: "
-                        "dias úteis × finais de semana"
-                    ),
-                    hover_data={
-                        "mediana_consumo_diario_l": ":.2f",
-                        "dias_observados": True
-                    }
-                )
-
-                st.plotly_chart(
-                    fig_dias,
-                    width="stretch"
-                )
-
-                st.caption(
-                    "Dias úteis são considerados de segunda a sexta-feira; "
-                    "finais de semana, sábado e domingo. Feriados não são "
-                    "classificados separadamente."
                 )
 
                 # ------------------------------------------------
@@ -2058,144 +2018,258 @@ with aba_perfis:
                     )
 
                 # ------------------------------------------------
-                # 6. TAXA HORÁRIA EQUIVALENTE
+                # 6. COMPARAÇÃO ENTRE DIAS ÚTEIS E FINS DE SEMANA
                 # ------------------------------------------------
 
                 st.subheader(
-                    "6. Taxa horária equivalente (estimativa)"
+                    "6. Padrões de consumo: dias úteis × fins de semana"
                 )
 
-                st.warning(
-                    "Os arquivos contêm consumo diário, não medições "
-                    "por hora. A divisão do consumo diário por 24 "
-                    "estima uma taxa horária média equivalente, mas "
-                    "não permite inferir em quais horas ocorreu "
-                    "o consumo."
+                st.markdown(
+                    """
+                    A comparação utiliza os consumos diários registrados.
+                    Os dias úteis correspondem a segunda a sexta-feira e
+                    os fins de semana a sábado e domingo. Como a base não
+                    contém medições horárias, esta análise não estima em
+                    quais horários a água foi consumida.
+                    """
                 )
 
-                diario_sala = (
+                # Agrega os medidores por data para estimar o consumo
+                # diário total observado na edificação.
+                diario_edificacao = (
                     perfil.groupby(
-                        ["data_dia", "sala"],
+                        ["data_dia", "tipo_dia"],
                         as_index=False
                     )
                     .agg(
-                        consumo_diario_sala_l=(
+                        consumo_total_dia_l=(
                             "consumo_diario",
                             "sum"
-                        )
-                    )
-                )
-
-                media_diaria_edificacao = (
-                    perfil.groupby("data_dia", as_index=False)
-                    .agg(
-                        consumo_diario_edificacao_l=(
-                            "consumo_diario",
-                            "sum"
-                        )
-                    )["consumo_diario_edificacao_l"]
-                    .mean()
-                )
-
-                medias_sala = (
-                    diario_sala.groupby(
-                        "sala",
-                        as_index=False
-                    )
-                    .agg(
-                        consumo_medio_diario_sala_l=(
-                            "consumo_diario_sala_l",
-                            "mean"
                         ),
-                        dias_observados=("data_dia", "nunique")
-                    )
-                    .sort_values(
-                        "consumo_medio_diario_sala_l",
-                        ascending=False
+                        salas_com_registro=("sala", "nunique"),
+                        medidores_com_registro=("codigo_medidor", "nunique")
                     )
                 )
 
-                if not medias_sala.empty:
-                    sala_horaria = st.selectbox(
-                        "Sala para consultar",
-                        options=medias_sala["sala"].tolist(),
-                        key="perfil_sala_horaria"
+                ordem_tipos = ["Dia útil", "Fim de semana"]
+
+                resumo_tipo_dia = (
+                    diario_edificacao.groupby(
+                        "tipo_dia",
+                        as_index=False
                     )
-
-                    media_diaria_sala = float(
-                        medias_sala.loc[
-                            medias_sala["sala"] == sala_horaria,
-                            "consumo_medio_diario_sala_l"
-                        ].iloc[0]
-                    )
-
-                    consumo_hora_edificacao = (
-                        float(media_diaria_edificacao) / 24
-                        if pd.notna(media_diaria_edificacao)
-                        else 0.0
-                    )
-
-                    consumo_hora_sala = (
-                        media_diaria_sala / 24
-                    )
-
-                    m1, m2 = st.columns(2)
-
-                    m1.metric(
-                        "Edificação — taxa média equivalente",
-                        f"{formatar_numero(consumo_hora_edificacao, 2)} L/h"
-                    )
-
-                    m2.metric(
-                        f"Sala {sala_horaria} — taxa média equivalente",
-                        f"{formatar_numero(consumo_hora_sala, 2)} L/h"
-                    )
-
-                    tabela_horaria = medias_sala.copy()
-
-                    tabela_horaria[
-                        "Consumo médio diário (L/dia)"
-                    ] = tabela_horaria[
-                        "consumo_medio_diario_sala_l"
-                    ]
-
-                    tabela_horaria[
-                        "Taxa média equivalente (L/h)"
-                    ] = (
-                        tabela_horaria[
-                            "consumo_medio_diario_sala_l"
-                        ] / 24
-                    )
-
-                    tabela_horaria = tabela_horaria.rename(
-                        columns={
-                            "sala": "Sala",
-                            "dias_observados": "Dias observados"
-                        }
-                    )
-
-                    tabela_horaria = tabela_horaria[
-                        [
-                            "Sala",
-                            "Consumo médio diário (L/dia)",
-                            "Taxa média equivalente (L/h)",
-                            "Dias observados"
-                        ]
-                    ]
-
-                    with st.expander(
-                        "Consultar taxa média equivalente de todas as salas"
-                    ):
-                        st.dataframe(
-                            tabela_horaria,
-                            width="stretch",
-                            hide_index=True
+                    .agg(
+                        consumo_medio_l=("consumo_total_dia_l", "mean"),
+                        consumo_mediano_l=("consumo_total_dia_l", "median"),
+                        dias_observados=("data_dia", "nunique"),
+                        media_salas_registradas=("salas_com_registro", "mean"),
+                        media_medidores_registrados=(
+                            "medidores_com_registro", "mean"
                         )
+                    )
+                )
+
+                resumo_tipo_dia["tipo_dia"] = pd.Categorical(
+                    resumo_tipo_dia["tipo_dia"],
+                    categories=ordem_tipos,
+                    ordered=True
+                )
+                resumo_tipo_dia = resumo_tipo_dia.sort_values("tipo_dia")
+
+                if not diario_edificacao.empty:
+                    c1, c2 = st.columns(2)
+
+                    for coluna, tipo in zip(
+                        [c1, c2],
+                        ordem_tipos
+                    ):
+                        linha = resumo_tipo_dia[
+                            resumo_tipo_dia["tipo_dia"] == tipo
+                        ]
+
+                        with coluna:
+                            if not linha.empty:
+                                dados_tipo = linha.iloc[0]
+                                st.metric(
+                                    f"Consumo médio — {tipo.lower()}",
+                                    f"{formatar_numero(dados_tipo['consumo_medio_l'], 1)} L/dia"
+                                )
+                                st.caption(
+                                    f"Mediana: "
+                                    f"{formatar_numero(dados_tipo['consumo_mediano_l'], 1)} L/dia · "
+                                    f"{int(dados_tipo['dias_observados'])} dias observados"
+                                )
+                            else:
+                                st.metric(
+                                    f"Consumo médio — {tipo.lower()}",
+                                    "Sem dados"
+                                )
+
+                    fig_tipo_dia = px.bar(
+                        resumo_tipo_dia,
+                        x="tipo_dia",
+                        y="consumo_medio_l",
+                        text="consumo_medio_l",
+                        hover_data={
+                            "consumo_mediano_l": ":.2f",
+                            "dias_observados": True,
+                            "media_salas_registradas": ":.1f",
+                            "media_medidores_registrados": ":.1f"
+                        },
+                        labels={
+                            "tipo_dia": "Tipo de dia",
+                            "consumo_medio_l": "Consumo médio diário total (L)",
+                            "consumo_mediano_l": "Consumo mediano diário (L)",
+                            "dias_observados": "Dias observados",
+                            "media_salas_registradas": "Média de salas com registro",
+                            "media_medidores_registrados": "Média de medidores com registro"
+                        },
+                        title="Consumo diário total: dias úteis × fins de semana"
+                    )
+
+                    fig_tipo_dia.update_traces(
+                        texttemplate="%{text:,.1f} L",
+                        textposition="outside",
+                        cliponaxis=False
+                    )
+                    fig_tipo_dia.update_layout(
+                        xaxis_title="",
+                        yaxis_title="Consumo médio diário (L)",
+                        showlegend=False,
+                        margin=dict(t=70, b=30)
+                    )
+
+                    st.plotly_chart(
+                        fig_tipo_dia,
+                        width="stretch"
+                    )
+
+                    # Distribuição diária: mostra a dispersão e os
+                    # possíveis valores extremos em cada grupo.
+                    fig_distribuicao = px.box(
+                        diario_edificacao,
+                        x="tipo_dia",
+                        y="consumo_total_dia_l",
+                        points="outliers",
+                        category_orders={"tipo_dia": ordem_tipos},
+                        hover_data=[
+                            "data_dia",
+                            "salas_com_registro",
+                            "medidores_com_registro"
+                        ],
+                        labels={
+                            "tipo_dia": "Tipo de dia",
+                            "consumo_total_dia_l": "Consumo total registrado no dia (L)",
+                            "data_dia": "Data",
+                            "salas_com_registro": "Salas com registro",
+                            "medidores_com_registro": "Medidores com registro"
+                        },
+                        title="Distribuição do consumo diário por tipo de dia"
+                    )
+
+                    st.plotly_chart(
+                        fig_distribuicao,
+                        width="stretch"
+                    )
+
+                    # Detalhamento por dia da semana para observar
+                    # padrões que uma divisão em dois grupos pode ocultar.
+                    nomes_dias = {
+                        0: "Segunda-feira",
+                        1: "Terça-feira",
+                        2: "Quarta-feira",
+                        3: "Quinta-feira",
+                        4: "Sexta-feira",
+                        5: "Sábado",
+                        6: "Domingo"
+                    }
+
+                    diario_edificacao["dia_semana_num"] = pd.to_datetime(
+                        diario_edificacao["data_dia"]
+                    ).dt.dayofweek
+                    diario_edificacao["dia_semana"] = (
+                        diario_edificacao["dia_semana_num"].map(nomes_dias)
+                    )
+
+                    resumo_semana = (
+                        diario_edificacao.groupby(
+                            ["dia_semana_num", "dia_semana"],
+                            as_index=False
+                        )
+                        .agg(
+                            consumo_medio_l=("consumo_total_dia_l", "mean"),
+                            dias_observados=("data_dia", "nunique")
+                        )
+                        .sort_values("dia_semana_num")
+                    )
+
+                    fig_semana = px.bar(
+                        resumo_semana,
+                        x="dia_semana",
+                        y="consumo_medio_l",
+                        text="consumo_medio_l",
+                        hover_data={"dias_observados": True},
+                        labels={
+                            "dia_semana": "Dia da semana",
+                            "consumo_medio_l": "Consumo médio diário total (L)",
+                            "dias_observados": "Dias observados"
+                        },
+                        title="Consumo médio por dia da semana"
+                    )
+                    fig_semana.update_traces(
+                        texttemplate="%{text:,.1f}",
+                        textposition="outside",
+                        cliponaxis=False
+                    )
+                    fig_semana.update_layout(
+                        xaxis_title="",
+                        yaxis_title="Consumo médio diário (L)",
+                        showlegend=False,
+                        margin=dict(t=70, b=30)
+                    )
+
+                    st.plotly_chart(
+                        fig_semana,
+                        width="stretch"
+                    )
+
+                    st.dataframe(
+                        resumo_tipo_dia[
+                            [
+                                "tipo_dia",
+                                "consumo_medio_l",
+                                "consumo_mediano_l",
+                                "dias_observados",
+                                "media_salas_registradas",
+                                "media_medidores_registrados"
+                            ]
+                        ].rename(
+                            columns={
+                                "tipo_dia": "Tipo de dia",
+                                "consumo_medio_l": "Consumo médio (L/dia)",
+                                "consumo_mediano_l": "Consumo mediano (L/dia)",
+                                "dias_observados": "Dias observados",
+                                "media_salas_registradas": "Média de salas com registro",
+                                "media_medidores_registrados": "Média de medidores com registro"
+                            }
+                        ),
+                        width="stretch",
+                        hide_index=True
+                    )
+
+                    st.caption(
+                        "Interprete as diferenças com cautela: o consumo diário "
+                        "total é calculado a partir dos registros disponíveis em "
+                        "cada data. Diferenças na quantidade de salas ou medidores "
+                        "registrados podem influenciar a comparação. Feriados não "
+                        "são separados dos demais dias úteis."
+                    )
 
                 else:
                     st.info(
-                        "Não há dados suficientes para calcular "
-                        "a taxa horária equivalente."
+                        "Não há dados suficientes para comparar dias úteis "
+                        "e fins de semana."
                     )
 
                 # ------------------------------------------------
