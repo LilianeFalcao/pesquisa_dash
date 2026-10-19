@@ -1681,192 +1681,145 @@ with aba_perfis:
                 )
 
                 # ------------------------------------------------
-                # 4. CONSUMO MÉDIO DIÁRIO POR SALA
+                # 4. COMPARAÇÃO DO CONSUMO ENTRE SALAS (2024 × 2025)
                 # ------------------------------------------------
 
-                st.subheader(
-                    "4. Consumo médio diário por sala"
+                st.subheader("4. Comparação do consumo entre salas — 2024 × 2025")
+                st.caption(
+                    "As barras agrupadas permitem comparar os mesmos indicadores "
+                    "de cada sala entre os anos selecionados."
+                )
+
+                metrica_comparacao = st.radio(
+                    "Indicador para comparar as salas",
+                    options=["Consumo médio diário", "Consumo total no período"],
+                    horizontal=True,
+                    key="perfil_metrica_comparacao"
                 )
 
                 diario_por_sala_ano = (
-                    perfil.groupby(
-                        ["sala", "ano_arquivo", "data_dia"],
-                        as_index=False
-                    )
+                    perfil.groupby(["sala", "ano_arquivo", "data_dia"], as_index=False)
                     .agg(
-                        consumo_total_dia_sala_l=(
-                            "consumo_diario",
-                            "sum"
-                        ),
-                        medidores_no_dia=(
-                            "codigo_medidor",
-                            "nunique"
-                        )
+                        consumo_total_dia_sala_l=("consumo_diario", "sum"),
+                        medidores_no_dia=("codigo_medidor", "nunique")
                     )
                 )
 
                 por_sala = (
-                    diario_por_sala_ano.groupby(
-                        ["sala", "ano_arquivo"],
-                        as_index=False
-                    )
+                    diario_por_sala_ano.groupby(["sala", "ano_arquivo"], as_index=False)
                     .agg(
-                        consumo_medio_diario_l=(
-                            "consumo_total_dia_sala_l",
-                            "mean"
-                        ),
-                        consumo_mediano_diario_l=(
-                            "consumo_total_dia_sala_l",
-                            "median"
-                        ),
+                        consumo_medio_diario_l=("consumo_total_dia_sala_l", "mean"),
+                        consumo_mediano_diario_l=("consumo_total_dia_sala_l", "median"),
+                        consumo_total_l=("consumo_total_dia_sala_l", "sum"),
                         dias_observados=("data_dia", "nunique"),
                         medidores=("medidores_no_dia", "max")
                     )
                 )
 
-                sala_norm = (
-                    por_sala["sala"]
-                    .astype(str)
-                    .map(nome_normalizado)
-                )
-
+                sala_norm = por_sala["sala"].astype(str).map(nome_normalizado)
                 mask_sala_valida = ~sala_norm.str.contains(
                     r"nao mapead|nao identificad|sem sala|desconhecid",
                     regex=True,
                     na=False
                 )
-
-                por_sala_mapeadas = por_sala[
-                    mask_sala_valida
-                ].copy()
+                por_sala_mapeadas = por_sala[mask_sala_valida].copy()
 
                 if (~mask_sala_valida).any():
                     st.caption(
-                        "Salas sem identificação confiável foram excluídas "
-                        "apenas dos gráficos comparativos por sala; seus "
-                        "registros permanecem nos indicadores gerais."
+                        "Salas sem identificação confiável foram excluídas apenas "
+                        "dos gráficos comparativos por sala; seus registros permanecem "
+                        "nos indicadores gerais."
                     )
 
+                anos_comparacao = sorted(
+                    [int(a) for a in anos_perfil_sel if int(a) in por_sala_mapeadas["ano_arquivo"].unique()]
+                )
+                if not anos_comparacao:
+                    anos_comparacao = sorted(por_sala_mapeadas["ano_arquivo"].dropna().astype(int).unique())
+
+                if len(anos_comparacao) > 2:
+                    anos_comparacao = anos_comparacao[-2:]
+
+                if len(anos_comparacao) < 2:
+                    st.warning("Selecione 2024 e 2025 nos filtros para comparar os dois anos.")
+
                 if not por_sala_mapeadas.empty:
+                    coluna_metrica = (
+                        "consumo_medio_diario_l"
+                        if metrica_comparacao == "Consumo médio diário"
+                        else "consumo_total_l"
+                    )
+                    rotulo_metrica = (
+                        "Consumo médio diário (L/dia)"
+                        if metrica_comparacao == "Consumo médio diário"
+                        else "Consumo total no período (L)"
+                    )
+
+                    dados_anos = por_sala_mapeadas[
+                        por_sala_mapeadas["ano_arquivo"].isin(anos_comparacao)
+                    ].copy()
+                    ranking_salas = (
+                        dados_anos.groupby("sala", as_index=False)[coluna_metrica]
+                        .sum()
+                        .sort_values(coluna_metrica, ascending=False)
+                    )
+                    max_salas = min(40, len(ranking_salas))
                     top_n = st.slider(
                         "Quantidade de salas no gráfico",
                         min_value=1,
-                        max_value=min(40, len(por_sala_mapeadas["sala"].unique())),
-                        value=min(15, len(por_sala_mapeadas["sala"].unique())),
+                        max_value=max_salas,
+                        value=min(12, max_salas),
                         key="perfil_top_n"
                     )
+                    salas_selecionadas = ranking_salas.head(top_n)["sala"].tolist()
+                    ranking_plot = dados_anos[dados_anos["sala"].isin(salas_selecionadas)].copy()
+                    ranking_plot["ano_arquivo"] = ranking_plot["ano_arquivo"].astype(str)
+                    ranking_plot["sala"] = ranking_plot["sala"].astype(str)
 
-                    ordenar_ano = (
-                        anos_perfil_sel[-1]
-                        if anos_perfil_sel
-                        else int(perfil["ano_arquivo"].max())
+                    fig_salas = px.bar(
+                        ranking_plot,
+                        x="sala",
+                        y=coluna_metrica,
+                        color="ano_arquivo",
+                        barmode="group",
+                        hover_data={
+                            "consumo_medio_diario_l": ":.2f",
+                            "consumo_mediano_diario_l": ":.2f",
+                            "consumo_total_l": ":.2f",
+                            "dias_observados": True,
+                            "medidores": True,
+                            "ano_arquivo": True,
+                            "sala": True
+                        },
+                        labels={
+                            coluna_metrica: rotulo_metrica,
+                            "ano_arquivo": "Ano",
+                            "sala": "Sala",
+                            "consumo_medio_diario_l": "Consumo médio diário (L/dia)",
+                            "consumo_mediano_diario_l": "Consumo mediano diário (L/dia)",
+                            "consumo_total_l": "Consumo total no período (L)"
+                        },
+                        title=f"Consumo por sala: {' × '.join(map(str, anos_comparacao))}",
+                        category_orders={"ano_arquivo": [str(a) for a in anos_comparacao]}
                     )
-
-                    ranking = (
-                        por_sala_mapeadas[
-                            por_sala_mapeadas["ano_arquivo"] == ordenar_ano
-                        ]
-                        .sort_values(
-                            "consumo_medio_diario_l",
-                            ascending=False
-                        )
-                        .head(top_n)
+                    fig_salas.update_layout(
+                        xaxis_title="Sala",
+                        yaxis_title=rotulo_metrica,
+                        xaxis_tickangle=-45,
+                        margin={"l": 20, "r": 20, "t": 70, "b": 90},
+                        legend_title_text="Ano"
                     )
-
-                    if not ranking.empty:
-                        ranking_plot = ranking.sort_values(
-                            "consumo_medio_diario_l"
-                        ).copy()
-
-                        ranking_plot["consumo_plot"] = (
-                            ranking_plot["consumo_medio_diario_l"]
-                        )
-
-                        max_valor = float(
-                            ranking_plot["consumo_plot"].max()
-                        )
-
-                        fig_salas = px.bar(
-                            ranking_plot,
-                            x="consumo_plot",
-                            y="sala",
-                            orientation="h",
-                            hover_data={
-                                "consumo_plot": ":.2f",
-                                "consumo_medio_diario_l": ":.2f",
-                                "consumo_mediano_diario_l": ":.2f",
-                                "dias_observados": True,
-                                "medidores": True
-                            },
-                            labels={
-                                "consumo_plot": "Consumo médio diário (L/dia)",
-                                "consumo_medio_diario_l": "Consumo médio diário (L/dia)",
-                                "consumo_mediano_diario_l": "Consumo mediano diário (L/dia)",
-                                "sala": "Sala"
-                            },
-                            title=(
-                                f"{len(ranking_plot)} salas com maior "
-                                f"consumo médio diário — {ordenar_ano}"
-                            )
-                        )
-
-                        if max_valor > 0:
-                            passo_bruto = max_valor / 5
-                            magnitude = (
-                                10 ** math.floor(math.log10(passo_bruto))
-                                if passo_bruto > 0
-                                else 1
-                            )
-
-                            candidatos = [1, 2, 2.5, 5, 10]
-
-                            passo = next(
-                                (
-                                    c * magnitude
-                                    for c in candidatos
-                                    if c * magnitude >= passo_bruto
-                                ),
-                                10 * magnitude
-                            )
-
-                            fig_salas.update_xaxes(
-                                range=[0, max_valor * 1.15],
-                                dtick=passo,
-                                tick0=0,
-                                title="Consumo médio diário (L/dia)"
-                            )
-
-                        fig_salas.update_layout(
-                            margin={
-                                "l": 20,
-                                "r": 20,
-                                "t": 70,
-                                "b": 45
-                            }
-                        )
-
-                        st.plotly_chart(
-                            fig_salas,
-                            width="stretch"
-                        )
+                    st.plotly_chart(fig_salas, use_container_width=True)
 
                     st.dataframe(
-                        por_sala_mapeadas.sort_values(
-                            [
-                                "ano_arquivo",
-                                "consumo_medio_diario_l"
-                            ],
-                            ascending=[True, False]
-                        ),
-                        width="stretch",
+                        por_sala_mapeadas[
+                            por_sala_mapeadas["ano_arquivo"].isin(anos_comparacao)
+                        ].sort_values(["sala", "ano_arquivo"]),
+                        use_container_width=True,
                         hide_index=True
                     )
-
                 else:
-                    st.info(
-                        "Não há salas com identificação confiável "
-                        "para compor o ranking."
-                    )
+                    st.info("Não há salas com identificação confiável para compor a comparação.")
 
                 # ------------------------------------------------
                 # 5. MAPA DE CALOR
